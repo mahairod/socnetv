@@ -215,8 +215,6 @@ QString stripUnnessParts(QString& data) {
 	QRegularExpressionMatchIterator i = tagRegex.globalMatch(data);
 	while ( i.hasNext() ) {
 		QRegularExpressionMatch match = i.next();
-		qInfo() << "Match: " << match.capturedTexts();
-
 		QStringList parts = match.capturedTexts();
 
 		QString tag = parts[1];
@@ -753,8 +751,8 @@ void WebCrawler::newLink(int s, QUrl target,  bool enqueue_to_frontier) {
         if (m_delayBetween) {
             int m_wait_msecs = rand() % m_delayBetween;
             qDebug() << "delay requested between signalStartSpider() calls. Setting a timer for:" << m_wait_msecs << "msecs";
-            QTimer* timer = new QTimer(this);
-            timer->singleShot(m_wait_msecs, starter);
+            QTimer* timer = new QTimer();
+            timer->singleShot(m_wait_msecs, this, starter);
             timer->callOnTimeout(timer, &QTimer::deleteLater);
         } else {
 			starter();
