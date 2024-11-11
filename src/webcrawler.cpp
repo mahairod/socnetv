@@ -29,9 +29,19 @@
 
 #include <QCryptographicHash>
 #include <QDebug>
+#include <QLoggingCategory>
 #include <QUrl>
 #include <QThread>
+#include <QtConcurrent/QtConcurrent>
 #include <QDeadlineTimer>
+#include <QRegularExpression>
+
+#include <functional>
+#include <set>
+
+static QLoggingCategory DBG_CATEGORY("net.crawler");
+
+#define qDebug() qCDebug(DBG_CATEGORY)
 
 /**
  * @brief Constructor from parent Graph thread. Inits variables.
@@ -41,7 +51,7 @@
  * @param extLinks
  * @param intLinks
  */
-WebCrawler::WebCrawler(QQueue<QUrl> *urlQueue,
+WebCrawler::WebCrawler(QCQueue<QUrl> *urlQueue,
         const QUrl &startUrl,
         const QStringList &urlPatternsIncluded,
         const QStringList &urlPatternsExcluded,
@@ -55,7 +65,43 @@ WebCrawler::WebCrawler(QQueue<QUrl> *urlQueue,
         const bool &extLinksIncluded,
         const bool &extLinksCrawl,
         const bool &socialLinks,
-        const int &delayBetween) {
+        const int &delayBetween)
+	:
+    // Initialize user-defined control variables and limits
+	    m_initialUrl(startUrl)
+		,m_maxUrls(maxN)								// max urls we'll check == max nodes in the social network
+		,m_maxLinksPerPage(maxLinksPerPage)			// max links per page to search for
+
+		,m_intLinks(intLinks)
+		,m_childLinks(childLinks)
+		,m_parentLinks(parentLinks)
+		,m_selfLinks(selfLinks)
+
+		,m_extLinksIncluded(extLinksIncluded)
+		,m_extLinksCrawl(extLinksCrawl)
+	    ,m_socialLinks(socialLinks)
+
+		,m_delayBetween(delayBetween)
+
+		,m_urlPatternsIncluded(urlPatternsIncluded)		// list of url patterns to include
+		,m_urlPatternsExcluded(urlPatternsExcluded)		// list of url patterns to exclude
+		,m_linkClasses(linkClasses)						// list of link classes to include
+		,m_socialLinksExcluded {
+			"facebook.com"
+			,"twitter.com"
+			,"linkedin.com"
+			,"instagram.com"
+			,"pinterest.com"
+			,"telegram.org"
+			,"telegram.me"
+			,"youtube.com"
+			,"reddit.com"
+			,"tumblr.com"
+			,"flickr.com"
+			,"plus.google.com"
+		}
+
+	{
 
     qDebug () << "WebCrawler constructed on thread:"
               << thread()
@@ -63,41 +109,10 @@ WebCrawler::WebCrawler(QQueue<QUrl> *urlQueue,
 
     m_urlQueue = urlQueue;
 
-    m_initialUrl = startUrl;
-
     // Initialize user-defined control variables and limits
 
-    m_urlPatternsIncluded = urlPatternsIncluded;    // list of url patterns to include
-    m_urlPatternsExcluded = urlPatternsExcluded;    // list of url patterns to include
-    m_linkClasses = linkClasses;                    // list of link classes to include
-    m_maxUrls=maxN;                                 // max urls we'll check == max nodes in the social network
-    m_maxLinksPerPage = maxLinksPerPage;            // max links per page to search for
-
-    m_intLinks = intLinks;
-    m_selfLinks = selfLinks;
-    m_childLinks = childLinks;
-    m_parentLinks = parentLinks;
-
-    m_extLinksIncluded = extLinksIncluded;
-    m_extLinksCrawl = extLinksCrawl;
-    m_socialLinks = socialLinks;
-    m_socialLinksExcluded << "facebook.com"
-                          << "twitter.com"
-                          << "linkedin.com"
-                          << "instagram.com"
-                          << "pinterest.com"
-                          << "telegram.org"
-                          << "telegram.me"
-                          << "youtube.com"
-                          << "reddit.com"
-                          << "tumblr.com"
-                          << "flickr.com"
-                          << "plus.google.com";
-
-    m_delayBetween = delayBetween;
-
-
-    knownUrls.clear();                              // a map of all known urls to their node number
+	threadPool = new QThreadPool(this);
+	threadPool->setExpiryTimeout(120000);
 
     m_discoveredNodes=1;                            // Counts discovered nodes -- Set the counter to 1, as we already know the initial url
 
@@ -114,6 +129,151 @@ WebCrawler::WebCrawler(QQueue<QUrl> *urlQueue,
 }
 
 
+typedef bool (StringPredicate)(const QString&);
+typedef std::function<StringPredicate> StrPredFun;
+
+typedef QPair<int,int> Region;
+
+
+struct reg_less {
+	bool operator()(const Region& x, const Region& y) const {
+		return x.second < y.first+1;
+	}
+};
+
+void mergeRegions(QList<Region>& cutRegions) {
+	std::set<Region, reg_less> regionSet;
+	for (Region r: cutRegions) {
+		Region cr = r;
+		auto [begin, end] = regionSet.equal_range(cr);
+		for (auto rit = begin; rit != end; ++rit) {
+			const Region& mr = *rit;
+			cr = qMakePair(
+				std::min(cr.first, mr.first),
+				std::max(cr.second, mr.second)
+			);
+		}
+		regionSet.erase(begin, end);
+		regionSet.insert(cr);
+	}
+
+	cutRegions.clear();
+	for (const Region& e: regionSet) {
+		cutRegions.append(e);
+	}
+
+}
+
+void invertRegions(Region universe, const QList<Region>& regions, QList<Region>& result) {
+	typedef std::set<Region, reg_less> myset;
+	using myit = myset::iterator;
+	myset regionSet(regions.begin(), regions.end());
+	auto [begin, end] = regionSet.equal_range(universe);
+
+	Region rest = universe;
+	result.clear();
+
+	for (myit it = begin; it != end; ++it) {
+		const Region& r = *it;
+
+		Region cross{std::max(r.first, rest.first), std::min(r.second, rest.second)};
+
+		if (cross.first > rest.first) {
+			result << Region(rest.first, cross.first);
+		}
+		rest = Region(cross.second, rest.second);
+	}
+	if (rest.second > rest.first) {
+		result << rest;
+	}
+}
+
+struct TagTriple {
+	QString tag;
+	QString id;
+	int offs;
+};
+
+QString stripUnnessParts(QString& data) {
+	QList<TagTriple> tagStack;
+	QList<Region> cutRegions;
+
+	StrPredFun translIdFilter = [](const QString& id) -> bool {
+		return id.startsWith("Translations");
+	};
+
+	QList<StrPredFun> idFilters;
+	idFilters << translIdFilter;
+
+	static QRegularExpression tagRegex("<(?'TAG'/?\\w+)(?:\\s+id=(?'I'(?P>VAL))|\\s+[\\w-]+(?:=(?P>VAL))?)*\\s*>(?(DEFINE)(?'VAL'\"[^\"]*\"|'[^']*'|\\d+))");
+
+	if (!tagRegex.isValid()) {
+		qInfo() << "QRegularExpression invalid, error: " << tagRegex.errorString() << " at pos. " << tagRegex.patternErrorOffset();
+	}
+
+	QList<QRegularExpressionMatch> matches;
+	QRegularExpressionMatchIterator i = tagRegex.globalMatch(data);
+	while ( i.hasNext() ) {
+		QRegularExpressionMatch match = i.next();
+		qInfo() << "Match: " << match.capturedTexts();
+
+		QStringList parts = match.capturedTexts();
+
+		QString tag = parts[1];
+		QString tid = parts.length()>2 ? parts[2] : "";
+		if (tid.size()>1) {
+			if (tid.front()=='"')
+				tid = tid.remove(0, 1);
+			if (tid.back()=='"')
+				tid.chop(1);
+		}
+		bool open = ! tag.startsWith('/');
+		if (open) {
+			int cutOffset = -1;
+			if (!tid.isEmpty()) {
+				for (const StrPredFun& pred: idFilters) {
+					if (pred(tid)) {
+						cutOffset = match.capturedStart();
+						break;
+					}
+				}
+			}
+			tagStack.append({tag, tid, cutOffset});
+		} else {
+			tag = tag.remove(0, 1);
+			TagTriple last;
+			last.offs = -1;
+			while (tag != last.tag && !tagStack.isEmpty()) {
+				last = tagStack.back();
+				tagStack.pop_back();
+			}
+			if (tag == last.tag && last.id.size() && last.offs >= 0) {
+				int endOffs = match.capturedEnd();
+				cutRegions << qMakePair(last.offs, endOffs);
+			}
+		}
+
+	}
+
+	mergeRegions(cutRegions);
+	QList<Region> regionsToSave;
+	invertRegions(Region(0, data.length()), cutRegions, regionsToSave);
+
+	QString newData;
+	{
+		int newSize = 0;
+		for (Region& r: regionsToSave) {
+			newSize += r.second - r.first;
+		}
+		newData.reserve(newSize);
+		for (Region& r: regionsToSave) {
+			int sz = r.second - r.first;
+			QStringRef ref(&data, r.first, sz);
+			newData.append( ref );
+		}
+	}
+	return newData;
+}
 
 
 /**
@@ -124,6 +284,11 @@ WebCrawler::WebCrawler(QQueue<QUrl> *urlQueue,
  * @param reply
  */
 void WebCrawler::parse(QNetworkReply *reply){
+	QtConcurrent::run(threadPool, this, &WebCrawler::parseImpl, reply);
+//	parseImpl(reply);
+}
+
+void WebCrawler::parseImpl(QNetworkReply *reply){
 
     qDebug () << "Parsing new network reply, on thread:" << this->thread();
 
@@ -132,11 +297,16 @@ void WebCrawler::parse(QNetworkReply *reply){
     QUrl currentUrl = reply->request().url();
     QString currentUrlStr = currentUrl.toString();
     QString locationHeader = reply->header(QNetworkRequest::LocationHeader).toString();
-    int sourceNode = knownUrls [ currentUrl ];
     QString scheme = currentUrl.scheme();
     QString host = currentUrl.host();
-    QUrl baseUrl = QUrl( scheme + "://" + host);
     QString path = currentUrl.path();
+
+    int sourceNode = -1;
+	{
+		QReadLocker rl(&m_urlsLock);
+	    sourceNode = knownUrls [ currentUrl ];
+	}
+
     qDebug() << "Reply HTML belongs to url:" << currentUrlStr
              << " sourceNode:" << sourceNode
              << "host:" << host
@@ -203,15 +373,51 @@ void WebCrawler::parse(QNetworkReply *reply){
     }
 
 
+	// remove whitespace from the start and the end
+	// all whitespace sequence becomes single space
+	page=page.simplified();
+
+    if (currentUrl.hasFragment())  {
+    	QString fragment = currentUrl.fragment();
+    	QString frgProp = "id=\"" + fragment + '\"';
+    	int frgPos = page.indexOf(frgProp);
+    	if (frgPos<0)  {
+	        qDebug() << "Missing fragment:"
+                 << fragment
+                 << " of a page :"
+                 << currentUrl.toString()
+                 << "\npage contents: " << page
+                 << "\nRETURN ##";
+	        return;
+		}
+		int frgStartTag = page.lastIndexOf('<', frgPos);
+		int frgStartTagEnd = page.indexOf(' ', frgStartTag);
+		QString tag = page.mid(frgStartTag, frgStartTagEnd - frgStartTag);
+		static QRegularExpression nextTagReg( tag + R"~( [^<>]*id="([\w]+)")~" );
+		if ( !nextTagReg.isValid() ) {
+	        qDebug() << "Invalid next-tag-regexp: " << nextTagReg.errorString()
+				<< ", pattern: /" << nextTagReg.pattern() << "/"
+				<< ", position: " << nextTagReg.patternErrorOffset();
+		}
+		QString anchRef = " href=\"#";
+		int nextFrgPos = -1;
+		auto match = nextTagReg.match(page, frgPos + fragment.size());
+		while (match.hasMatch()) {
+			QString capture = match.captured(1);
+			if ( page.contains(anchRef + capture) ) { // found next fragment
+				nextFrgPos = match.capturedStart();
+				break;
+			}
+		}
+		page = page.mid(frgStartTag, nextFrgPos);
+    }
+
+    page = stripUnnessParts(page);
+
     // Main Loop: While there are more links in the page, parse them
     qDebug() << "Searching for href links inside the page code...";
-    while (page.contains(" href")) {
+    while (page.contains(" href") && !interrupted("parse")) {
 
-        if ( QThread::currentThread()->isInterruptionRequested() ) {
-            qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-            emit finished("message from parse() -  interruptionRequested");
-            return;
-        }
         if (m_maxUrls>0) {
             if (m_discoveredNodes >= m_maxUrls ) {
                 qDebug () <<"STOP because I have reached m_maxUrls.";
@@ -219,10 +425,6 @@ void WebCrawler::parse(QNetworkReply *reply){
                 return;
             }
         }
-
-        // remove whitespace from the start and the end
-        // all whitespace sequence becomes single space
-        page=page.simplified();
 
         start=page.indexOf (" href");		//Find its pos
         // Why " href" instead of "href"?
@@ -257,8 +459,8 @@ void WebCrawler::parse(QNetworkReply *reply){
         newUrl = QUrl(newUrlStr);
 
         if (newUrl.isRelative()) {
-            qDebug() << "newUrl is RELATIVE. Merging baseUrl with it.";
-            newUrl=baseUrl.resolved(newUrl);
+            qDebug() << "newUrl is RELATIVE. Merging currentUrl with it.";
+            newUrl = currentUrl.resolved(newUrl);
         }
 
         if (!newUrl.isValid()) {
@@ -305,13 +507,11 @@ void WebCrawler::parse(QNetworkReply *reply){
         }
 
         // Check if newUrl is compatible with the url patterns the user asked for
-        m_urlPatternAllowed = true;
+        bool urlPatternAllowed = true;
 
-        for (constIterator = m_urlPatternsIncluded.constBegin();
-             constIterator != m_urlPatternsIncluded.constEnd();
-             ++constIterator)  {
+        for (const QString& elem: m_urlPatternsIncluded)  {
 
-            urlPattern = (*constIterator).toLocal8Bit().constData();
+            QString urlPattern = elem.toLocal8Bit().constData();
 
             if (urlPattern.isEmpty()) {
                 continue;
@@ -324,20 +524,18 @@ void WebCrawler::parse(QNetworkReply *reply){
                 break;
             }
             else {
-                qDebug() << "newUrl not in allowed url patterns. I WILL SKIP IT. ";
-                m_urlPatternAllowed = false;
+                qDebug() << "newUrl not in allowed url patterns. I WILL SKIP IT. Pattern: " << urlPattern;
+                urlPatternAllowed = false;
             }
 
         }
 
 
-        m_urlPatternNotAllowed = false;
+        bool urlPatternNotAllowed = false;
 
-        for (constIterator = m_urlPatternsExcluded.constBegin();
-             constIterator != m_urlPatternsExcluded.constEnd();
-             ++constIterator)  {
-
-            urlPattern = (*constIterator).toLocal8Bit().constData();
+        if (urlPatternAllowed)
+        for (const QString& pattern: m_urlPatternsExcluded) {
+            QString urlPattern = pattern.toLocal8Bit().constData();
 
             if (urlPattern.isEmpty())
                 continue;
@@ -345,17 +543,15 @@ void WebCrawler::parse(QNetworkReply *reply){
                 qDebug() << "newUrl in excluded url patterns:"
                           << urlPattern
                           << "I WILL SKIP IT.";
-                m_urlPatternNotAllowed = true;
+                urlPatternNotAllowed = true;
                 break;
-            }
-            else {
-                qDebug() << "newUrl not in excluded url patterns. OK.";
             }
 
         }
+        if (urlPatternNotAllowed)
+			qDebug() << "newUrl not in excluded url patterns. OK.";
 
-
-        if (m_urlPatternAllowed && !m_urlPatternNotAllowed) {
+        if (urlPatternAllowed && !urlPatternNotAllowed) {
 
             if ( newUrl.isRelative() ) {
                 newUrl = currentUrl.resolved(newUrl);
@@ -407,18 +603,17 @@ void WebCrawler::parse(QNetworkReply *reply){
                         continue;
                     }
                     else {
-                        m_urlIsSocial = false;
+                        bool urlIsSocial = false;
                         if ( !m_socialLinks ) {
-                            for (constIterator = m_socialLinksExcluded.constBegin();
-                                 constIterator != m_socialLinksExcluded.constEnd();
-                                 ++constIterator)  {
-                                urlPattern = (*constIterator).toLocal8Bit().constData();
+							QString urlPattern;
+                            for (const QString& link: m_socialLinksExcluded)  {
+                                urlPattern = link.toLocal8Bit().constData();
                                 if ( newUrl.host().contains ( urlPattern) ) {
-                                    m_urlIsSocial = true;
+                                    urlIsSocial = true;
                                     break;
                                 }
                             }
-                            if ( m_urlIsSocial) {
+                            if ( urlIsSocial) {
                                 qDebug() << "newUrl in excluded social links:"
                                          << urlPattern
                                          << "CONTINUE ";
@@ -463,9 +658,9 @@ void WebCrawler::parse(QNetworkReply *reply){
                 }
             }
 
+			validUrlsInPage ++;
         } // end if in allowed patterns
 
-        validUrlsInPage ++;
 
         qDebug() << "validUrlsInPage:" << validUrlsInPage << "in page:" << currentUrlStr;
 
@@ -504,96 +699,87 @@ void WebCrawler::newLink(int s, QUrl target,  bool enqueue_to_frontier) {
     }
 
     // check if the new url has been discovered previously
-    QMap<QUrl, int>::const_iterator index = knownUrls.constFind(target);
-    if (  index!= knownUrls.constEnd() ) {
-        qDebug()<< "Target already discovered (in knownUrls) as node:" << index.value();
-        if  (s !=index.value()) {
-
-            if ( QThread::currentThread()->isInterruptionRequested() ) {
-                qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-                emit finished("message from parse() -  interruptionRequested");
-                return;
-            }
+    bool urlExists = false;
+    int linkInd = -1;
+    {
+		QReadLocker rl(&m_urlsLock);
+		QMap<QUrl, int>::const_iterator index = knownUrls.constFind(target);
+		urlExists = index != knownUrls.constEnd();
+	    if ( urlExists ) {
+			linkInd = index.value();
+	    }
+    }
+    if ( urlExists ) {
+        qDebug()<< "Target already discovered (in knownUrls) as node:" << linkInd;
+		if (interrupted("newLink")) return;
+        if  (s !=linkInd) {
 
             qDebug()<< "Emitting signalCreateEdge"
                     << s << "->"
-                    << index.value()
+                    << linkInd
                     << "and RETURN.";
-            emit signalCreateEdge (s, index.value() );
+            emit signalCreateEdge (s, linkInd );
         }
         else {
             qDebug()<< "Self links not allowed. RETURN.";
         }
         return;
+    } else {
+		QWriteLocker wl(&m_urlsLock);
+		linkInd = m_discoveredNodes++;
+		knownUrls[target] = linkInd;
     }
 
-    m_discoveredNodes++;
-    knownUrls[target]=m_discoveredNodes;
+    if (interrupted("newLink")) return;
 
-    if ( QThread::currentThread()->isInterruptionRequested() ) {
-        qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-        emit finished("message from parse() -  interruptionRequested");
-        return;
-    }
-
-    qDebug()<< "Target just discovered. Emitting signalCreateNode:" << m_discoveredNodes
+    qDebug()<< "Target just discovered. Emitting signalCreateNode:" << linkInd
             << "for url:"<< target.toString();
 
-    emit signalCreateNode( m_discoveredNodes, target.toString(), false);
+    emit signalCreateNode( linkInd, target.toString(), false);
 
     if (enqueue_to_frontier) {
 
         m_urlQueue->enqueue(target);
 
-        qDebug()<< "Enqueued new node:" << m_discoveredNodes <<  "to urlQueue."
+        qDebug()<< "Enqueued new node:" << linkInd <<  "to urlQueue."
                    << "queue size: "<<  m_urlQueue->size()
                    << " - Emitting signalStartSpider...";
 
         // Check if we need to add some delay between requests
+        auto starter = [this]{
+			if (interrupted("newLink")) return;
+			emit signalStartSpider();
+		};
         if (m_delayBetween) {
             int m_wait_msecs = rand() % m_delayBetween;
-            qDebug() << "delay requested between signalStartSpider() calls. Setting a deadline for:" << m_wait_msecs << "msecs";
-            QDeadlineTimer deadline(m_wait_msecs);
-            do {
-//                qDebug() << "deadline.remainingTime():" << deadline.remainingTime() << "msecs";
-            } while (deadline.remainingTime() > 0 && this->thread()->isRunning());
-
-            if ( QThread::currentThread()->isInterruptionRequested() ) {
-                qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-                emit finished("message from parse() -  interruptionRequested");
-                return;
-            }
-
-            emit signalStartSpider();
+            qDebug() << "delay requested between signalStartSpider() calls. Setting a timer for:" << m_wait_msecs << "msecs";
+            QTimer* timer = new QTimer(this);
+            timer->singleShot(m_wait_msecs, starter);
+            timer->callOnTimeout(timer, &QTimer::deleteLater);
+        } else {
+			starter();
         }
-        else {
-            if ( QThread::currentThread()->isInterruptionRequested() ) {
-                qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-                emit finished("message from parse() -  interruptionRequested");
-                return;
-            }
-            emit signalStartSpider();
-        }
-
-
-
     }
     else {
         qDebug()<< "NOT adding new node to queue";
     }
 
-    if ( QThread::currentThread()->isInterruptionRequested() ) {
-        qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
-        emit finished("message from parse() -  interruptionRequested");
-        return;
-    }
+	if (interrupted("newLink")) return;
 
     qDebug()<< "Emitting signalCreateEdge"
-            << s << "->" << m_discoveredNodes;
+            << s << "->" << linkInd;
 
-    emit signalCreateEdge (s, m_discoveredNodes);
+    emit signalCreateEdge (s, linkInd);
 
+}
 
+bool WebCrawler::interrupted(const char* func) {
+    if ( QThread::currentThread()->isInterruptionRequested() ) {
+        qDebug () <<"STOP because currentThread()->isInterruptionRequested() == true.";
+        emit finished(QString("message from ") + func + "() -  interruptionRequested");
+        return true;
+    }
+	return false;
 }
 
 
@@ -603,10 +789,6 @@ WebCrawler::~WebCrawler() {
     qDebug() << "Destructor running. Clearing vars...";
 
     knownUrls.clear();
-    m_urlPatternsIncluded.clear();
-    urlPattern="";
-    m_urlPatternsExcluded.clear();
-    m_linkClasses.clear();
     m_discoveredNodes = 0;
 
 

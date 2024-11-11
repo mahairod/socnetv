@@ -33,6 +33,7 @@
 #include <QtWidgets>
 #include <QtGlobal>
 #include <QtDebug>
+#include <QLoggingCategory>
 #include <QPageSize>
 #include <QPrintDialog>
 #include <QProgressDialog>
@@ -85,6 +86,7 @@
 #include "forms/dialogsysteminfo.h"
 
 
+static QLoggingCategory DBG_CATEGORY("main");
 
 /**
  * @brief
@@ -8815,7 +8817,7 @@ void MainWindow::slotNetworkWebCrawler (const QUrl &startUrl,
  */
 void MainWindow::slotNetworkManagerRequest(const QUrl &url, const NetworkRequestType &requestType) {
 
-    qDebug() << "New network request for url:" << url.toString() << "requestType:"<< requestType;
+    qCDebug(DBG_CATEGORY) << "New network request for url:" << url.toString() << "requestType:"<< requestType;
 
     // Create a network request object
     QNetworkRequest request;
@@ -8829,7 +8831,7 @@ void MainWindow::slotNetworkManagerRequest(const QUrl &url, const NetworkRequest
                 "SocNetV harmless spider - see https://socnetv.org");
 
     // Create a network reply object through which we will make the call and handle the reply content
-    qDebug() << "Creating a network reply object and making the call...";
+    qCDebug(DBG_CATEGORY) << "Creating a network reply object and making the call...";
     QNetworkReply *reply = networkManager->get(request) ;
 
     // Connect signals and slots

@@ -62,7 +62,11 @@
 #include "graphicsnode.h"
 #include "graphicsedge.h"
 
+#include <QLoggingCategory>
 
+static QLoggingCategory DBG_CATEGORY("graph");
+
+// #define qDebug(...) qCDebug(DBG_CATEGORY, __VA_ARGS__)
 
 /**
  * @brief Graph::Graph
@@ -3488,7 +3492,7 @@ void Graph::startWebCrawler(
     }
 
     // Create our url queue
-    urlQueue = new QQueue<QUrl>;
+    urlQueue = new QCQueue<QUrl>;
 
     // Enqueue the start QUrl
     urlQueue->enqueue(startUrl);
@@ -3575,22 +3579,22 @@ void Graph::webSpider(){
 
         //  Until we crawl all urls in urlQueue.
         if ( urlQueue->size() == 0 ) {
-            qDebug () <<"webSpider - urlQueue is empty. Break for now... "  ;
+            qCDebug(DBG_CATEGORY) <<"webSpider - urlQueue is empty. Break for now... "  ;
             break;
         }
 
         // or until we have reached m_maxNodes
         if (m_crawler_max_urls > 0 && m_crawler_visited_urls == m_crawler_max_urls) {
-            qDebug () << "webSpider - reached m_crawler_max_urls. Break." ;
+            qCDebug(DBG_CATEGORY) << "webSpider - reached m_crawler_max_urls. Break." ;
             break;
         }
 
         // Take the first url awaiting in the queue
-        qDebug() << "webSpider - urlQueue size: " << urlQueue->size()
+        qCDebug(DBG_CATEGORY) << "webSpider - urlQueue size: " << urlQueue->size()
                  << " - Taking the first url from the urlQueue  ";
         QUrl currentUrl = urlQueue->dequeue();
 
-        qDebug() << "webSpider - url to download: "
+        qCDebug(DBG_CATEGORY) << "webSpider - url to download: "
                  <<  currentUrl
                   << "Increasing m_crawler_visited_urls to:" << m_crawler_visited_urls + 1
                   << "and emitting signal signalNetworkManagerRequest to MW...";

@@ -29,7 +29,9 @@
 #define WEBCRAWLER_H
 
 #include <QNetworkReply>
-#include <QQueue>
+#include <QThreadPool>
+#include <QReadWriteLock>
+#include "QCQueue.h"
 
 QT_BEGIN_NAMESPACE
 class QUrl;
@@ -48,7 +50,7 @@ class WebCrawler : public QObject  {
 public:
 
     WebCrawler (
-            QQueue<QUrl> *urlQueue,
+            QCQueue<QUrl> *urlQueue,
             const QUrl &startUrl,
             const QStringList &urlPatternsIncluded,
             const QStringList &urlPatternsExcluded,
@@ -80,33 +82,36 @@ signals:
     void finished (QString);
 
 private:
-    QQueue<QUrl> *m_urlQueue;
+    QCQueue<QUrl> *m_urlQueue;
+    QThreadPool *threadPool;
+
+    // a map of all known urls to their node number
     QMap <QUrl, int> knownUrls;
-    QUrl m_initialUrl;
-    int m_maxUrls;
-    int m_discoveredNodes;
-    int m_maxLinksPerPage;
+	QReadWriteLock m_urlsLock;
 
-    bool m_intLinks;
-    bool m_childLinks;
-    bool m_parentLinks;
-    bool m_selfLinks ;
-    bool m_extLinksIncluded;
-    bool m_extLinksCrawl;
-    bool m_socialLinks;
-    bool m_urlIsSocial;
+    volatile int m_discoveredNodes;
 
-    int m_delayBetween;
+    const QUrl m_initialUrl;
+    const int m_maxUrls;
+    const int m_maxLinksPerPage;
 
-    QStringList m_urlPatternsIncluded;
-    QString urlPattern;
-    QStringList m_urlPatternsExcluded;
-    QStringList m_linkClasses;
-    QStringList m_socialLinksExcluded;
-    QStringList::const_iterator constIterator;
-    bool m_urlPatternAllowed;
-    bool m_urlPatternNotAllowed;
-    bool m_linkClassAllowed;
+    const bool m_intLinks;
+    const bool m_childLinks;
+    const bool m_parentLinks;
+    const bool m_selfLinks;
+    const bool m_extLinksIncluded;
+    const bool m_extLinksCrawl;
+    const bool m_socialLinks;
+
+    const int m_delayBetween;
+
+    const QStringList m_urlPatternsIncluded;
+    const QStringList m_urlPatternsExcluded;
+    const QStringList m_linkClasses;
+    const QStringList m_socialLinksExcluded;
+
+    void parseImpl(QNetworkReply *reply);
+    bool interrupted(const char* func);
 };
 
 

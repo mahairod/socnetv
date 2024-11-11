@@ -48,6 +48,7 @@
 #include <stack>
 #include <map>
 
+#include "QCQueue.h"
 #include "global.h"
 #include "graphvertex.h"
 #include "matrix.h"
@@ -1187,7 +1188,7 @@ private:
 
     WebCrawler *web_crawler;                     // Our web crawler threaded class. This will parse the downloaded HTML.
 
-    QQueue<QUrl> *urlQueue;                     // A queue where the crawler will put urls for the network manager to download
+    QCQueue<QUrl> *urlQueue;                     // A queue where the crawler will put urls for the network manager to download
 
     int m_crawler_max_urls;                      // maximum urls we'll visit (max nodes in the resulted network)
     int m_crawler_visited_urls;                  // A counter of the urls visited.
